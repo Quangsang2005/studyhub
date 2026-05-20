@@ -1,0 +1,410 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+ * LoginPage.jsx — StudyHub sign-in page
+ *
+ * Layout: Centered card on dark gradient background.
+ * Auth options: Username/password form OR Google Sign-In button.
+ * No email verification gate — Google handles its own verification,
+ * and local accounts can sign in immediately with username + password.
+ *
+ * Design: Direction A — Campus Lab tokens, no inline hex colors.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+import { useEffect, useRef, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import Navbar from '../../components/navbar/Navbar'
+import GoogleSignInButton from '../../components/GoogleSignInButton'
+import SubmitSpinner from '../../components/SubmitSpinner'
+import { getGoogleRedirectUri } from '../../components/googleSignInHelpers'
+import { AnimatedLogoMark as SiteAnimatedLogoMark } from '../../components/Icons'
+import { API, GOOGLE_CLIENT_ID } from '../../config'
+import { fadeInUp } from '../../lib/animations'
+import { getAuthenticatedHomePath } from '../../lib/authNavigation'
+import { useSession, SESSION_EXPIRED_FLAG } from '../../lib/session-context'
+import { LOGGED_OUT_FLAG } from '../../lib/session'
+import { useRolesV2Flags, isRolesV2FlagEnabled } from '../../lib/rolesV2Flags'
+import { useFormValidation } from '../../lib/useFormValidation'
+import './LoginPage.css'
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const { completeAuthentication } = useSession()
+  const { oauthPicker: oauthPickerEnabled } = useRolesV2Flags()
+  const cardRef = useRef(null)
+
+  /* ── State ─────────────────────────────────────────────────────────── */
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [showForgot, setShowForgot] = useState(false)
+  const [sessionExpired, setSessionExpired] = useState(false)
+  const [loggedOut, setLoggedOut] = useState(false)
+  const { errors, setErrors, clearFieldError, focusFirstError, getFieldProps } = useFormValidation()
+
+  /* Defined BEFORE the redirect-detection useEffect because the React
+   * Compiler flags forward references even when JS would hoist them. */
+  async function handleGoogleCodeExchange(code) {
+    setLoading(true)
+    setError('')
+    try {
+      const response = await fetch(`${API}/api/auth/google/code`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, redirectUri: getGoogleRedirectUri() }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setError(data.error || 'Google sign-in failed.')
+        return
+      }
+      if (data.status === 'needs_role' && data.tempToken) {
+        // See useRegisterFlow.js — same race fix. Read the live flag
+        // value via the imperative helper so we don't false-flash the
+        // "paused" banner during the OAuth callback.
+        const oauthPickerLive = oauthPickerEnabled || (await isRolesV2FlagEnabled('oauthPicker'))
+        if (!oauthPickerLive) {
+          setError('New Google signups are paused right now. Please sign up with email instead.')
+          return
+        }
+        try {
+          sessionStorage.setItem(
+            'studyhub.google.pending',
+            JSON.stringify({
+              tempToken: data.tempToken,
+              email: data.email,
+              name: data.name,
+              avatarUrl: data.avatarUrl,
+            }),
+          )
+        } catch {
+          /* ignore */
+        }
+        navigate('/signup/role', { replace: true })
+        return
+      }
+      completeAuthentication(data.user)
+      navigate(getAuthenticatedHomePath(data.user), { replace: true })
+    } catch {
+      setError('Check your connection and try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  /* ── Detect session-expired redirect + Google OAuth redirect code ── */
+  useEffect(() => {
+    // Defer setState calls out of the synchronous effect body so the
+    // React Compiler doesn't flag them. The flags read from
+    // sessionStorage / URLSearchParams are still inspected here so a
+    // race against another tab's setItem stays accurate.
+    let expired = false
+    let loggedOutFlag = false
+    try {
+      if (sessionStorage.getItem(SESSION_EXPIRED_FLAG)) {
+        expired = true
+        sessionStorage.removeItem(SESSION_EXPIRED_FLAG)
+      }
+      if (sessionStorage.getItem(LOGGED_OUT_FLAG)) {
+        loggedOutFlag = true
+        sessionStorage.removeItem(LOGGED_OUT_FLAG)
+      }
+    } catch {
+      /* private mode */
+    }
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('expired') === '1') {
+      expired = true
+      params.delete('expired')
+      const clean = params.toString()
+      window.history.replaceState({}, '', window.location.pathname + (clean ? `?${clean}` : ''))
+    }
+
+    Promise.resolve().then(() => {
+      if (expired) setSessionExpired(true)
+      if (loggedOutFlag) setLoggedOut(true)
+    })
+
+    // Google OAuth redirect-flow: Google redirected back with ?code=...
+    const googleCode = params.get('code')
+    if (googleCode) {
+      // Clean the code from the URL immediately
+      params.delete('code')
+      params.delete('scope')
+      params.delete('authuser')
+      params.delete('prompt')
+      const cleanUrl = params.toString()
+      window.history.replaceState(
+        {},
+        '',
+        window.location.pathname + (cleanUrl ? `?${cleanUrl}` : ''),
+      )
+      // Exchange the code for an authenticated session
+      Promise.resolve().then(() => handleGoogleCodeExchange(googleCode))
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ── Card entrance animation ───────────────────────────────────────── */
+  useEffect(() => {
+    if (cardRef.current) fadeInUp(cardRef.current, { duration: 450, y: 20 })
+  }, [])
+
+  /* ── Username + password login handler ─────────────────────────────── */
+  async function handleLogin(event) {
+    event.preventDefault()
+    const nextErrors = {}
+    if (!username.trim()) nextErrors.username = 'Enter your username.'
+    if (!password.trim()) nextErrors.password = 'Enter your password.'
+    if (Object.keys(nextErrors).length > 0) {
+      setErrors(nextErrors)
+      setError('')
+      focusFirstError(nextErrors)
+      return
+    }
+
+    setLoading(true)
+    setError('')
+    setErrors({})
+    setShowForgot(false)
+
+    try {
+      const response = await fetch(`${API}/api/auth/login`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: username.trim(),
+          password,
+        }),
+      })
+      const data = await response.json()
+
+      if (!response.ok) {
+        setError(data.error || 'Could not sign you in.')
+        setShowForgot(Boolean(data.showForgot))
+        return
+      }
+
+      // High-risk login: the server asked us to verify via an emailed code.
+      if (data.status === 'challenge' && data.challengeId) {
+        navigate(`/login/challenge/${encodeURIComponent(data.challengeId)}`, { replace: true })
+        return
+      }
+
+      completeAuthentication(data.user)
+      navigate(getAuthenticatedHomePath(data.user), { replace: true })
+    } catch {
+      setError('Check your connection and try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  /* ── Google OAuth success handler ──────────────────────────────────── */
+  async function handleGoogleSuccess(credentialResponse) {
+    if (!credentialResponse?.credential) {
+      setError('Google sign-in did not return a valid credential.')
+      return
+    }
+
+    setLoading(true)
+    setError('')
+
+    try {
+      const response = await fetch(`${API}/api/auth/google`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential: credentialResponse.credential }),
+      })
+      const data = await response.json()
+
+      if (!response.ok) {
+        setError(data.error || 'Google sign-in failed.')
+        return
+      }
+
+      if (data.status === 'needs_role' && data.tempToken) {
+        // Same race fix as the code-callback path above — read the
+        // flag via imperative helper to avoid stale closure value.
+        const oauthPickerLive = oauthPickerEnabled || (await isRolesV2FlagEnabled('oauthPicker'))
+        if (!oauthPickerLive) {
+          setError('New Google signups are paused right now. Please sign up with email instead.')
+          return
+        }
+        try {
+          sessionStorage.setItem(
+            'studyhub.google.pending',
+            JSON.stringify({
+              tempToken: data.tempToken,
+              email: data.email,
+              name: data.name,
+              avatarUrl: data.avatarUrl,
+            }),
+          )
+        } catch {
+          /* ignore storage failures */
+        }
+        navigate('/signup/role', { replace: true })
+        return
+      }
+
+      completeAuthentication(data.user)
+      navigate(getAuthenticatedHomePath(data.user), { replace: true })
+    } catch {
+      setError('Check your connection and try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  /* ── Render ────────────────────────────────────────────────────────── */
+  return (
+    <div className="login-page">
+      <Navbar variant="landing" />
+
+      {/* Decorative background orbs */}
+      <div className="login-orb login-orb--blue" />
+      <div className="login-orb login-orb--purple" />
+      <div className="login-orb login-orb--green" />
+
+      {/* ── Main card ────────────────────────────────────────────────── */}
+      <main id="main-content" ref={cardRef} className="login-main">
+        <div className="login-card">
+          {/* ── Logo mark + heading ──────────────────────────────────── */}
+          {/* Using the official site logo (animated tree with color-cycling
+              branches/leaves) instead of the previous generic placeholder
+              SVG, so the first authenticated surface matches the brand mark
+              shown elsewhere. AnimatedLogoMark respects
+              prefers-reduced-motion. */}
+          <div className="login-header">
+            <div className="login-logo-mark" style={{ background: 'transparent' }}>
+              <SiteAnimatedLogoMark size={56} />
+            </div>
+            <h1 className="login-h1">Welcome back</h1>
+            <p className="login-subtitle">Sign in to your study sheets, dashboard, and more.</p>
+          </div>
+
+          {/* ── Session-expired banner ──────────────────────────────── */}
+          {sessionExpired && (
+            <div role="status" className="login-alert login-alert--warning">
+              <span className="login-alert-icon" aria-hidden="true">
+                !
+              </span>
+              <span>Your session expired. Sign in again to pick up where you left off.</span>
+            </div>
+          )}
+
+          {/* ── Logged-out banner ─────────────────────────────────── */}
+          {loggedOut && !sessionExpired && (
+            <div role="status" className="login-alert login-alert--info">
+              You've been signed out.
+            </div>
+          )}
+
+          {/* ── Error message ────────────────────────────────────────── */}
+          {error && (
+            <div role="alert" className="login-alert login-alert--danger">
+              {error}
+            </div>
+          )}
+
+          {/* ── Google Sign-In button (GIS iframe + redirect fallback) ── */}
+          {GOOGLE_CLIENT_ID && (
+            <>
+              <div className="login-google-wrap">
+                <GoogleSignInButton
+                  onSuccess={handleGoogleSuccess}
+                  onError={(msg) => setError(msg || 'Google sign-in was cancelled or failed.')}
+                  text="signin_with"
+                  width={300}
+                />
+              </div>
+              <div className="login-divider">
+                <div className="login-divider-line login-divider-line--left" />
+                <span className="login-divider-text">or continue with</span>
+                <div className="login-divider-line login-divider-line--right" />
+              </div>
+            </>
+          )}
+
+          {/* ── Username + Password form ─────────────────────────────── */}
+          <form onSubmit={handleLogin}>
+            <div className="login-field">
+              <label htmlFor="login-username" className="login-label">
+                Username
+              </label>
+              <input
+                id="login-username"
+                {...getFieldProps('username', { id: 'login-username' })}
+                value={username}
+                onChange={(event) => {
+                  setUsername(event.target.value)
+                  setError('')
+                  setShowForgot(false)
+                  clearFieldError('username')
+                }}
+                autoComplete="username"
+                placeholder="Enter your username"
+                className="login-input"
+              />
+              {errors.username && (
+                <p id="login-username-error" className="sh-field-error" role="alert">
+                  {errors.username}
+                </p>
+              )}
+            </div>
+
+            <div className="login-field login-field--last">
+              <label htmlFor="login-password" className="login-label">
+                Password
+              </label>
+              <input
+                id="login-password"
+                type="password"
+                {...getFieldProps('password', { id: 'login-password' })}
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value)
+                  setError('')
+                  setShowForgot(false)
+                  clearFieldError('password')
+                }}
+                autoComplete="current-password"
+                placeholder="Enter your password"
+                className="login-input"
+              />
+              {errors.password && (
+                <p id="login-password-error" className="sh-field-error" role="alert">
+                  {errors.password}
+                </p>
+              )}
+            </div>
+
+            <button type="submit" disabled={loading} className="login-submit-btn">
+              {loading && <SubmitSpinner label="Signing in" />}
+              {loading ? 'Signing in…' : 'Sign In'}
+            </button>
+
+            <div className="login-forgot-wrap">
+              <Link to="/forgot-password" className="login-link">
+                Forgot username or password?
+              </Link>
+              {showForgot && (
+                <div className="login-forgot-hint">Use the link above to reset your password.</div>
+              )}
+            </div>
+          </form>
+
+          {/* ── Register link ────────────────────────────────────────── */}
+          <div className="login-register-section">
+            Don't have an account?{' '}
+            <Link to="/register" className="login-link login-link--bold">
+              Create one here
+            </Link>
+          </div>
+        </div>
+      </main>
+    </div>
+  )
+}

@@ -1,0 +1,670 @@
+/**
+ * library.service.js -- Service layer for Google Books API search, detail, and caching.
+ */
+
+const {
+  GOOGLE_BOOKS_BASE,
+  GOOGLE_BOOKS_API_KEY,
+  CACHE_TTL,
+  DEFAULT_PAGE_SIZE,
+} = require('./library.constants')
+const cache = require('./library.cache')
+const { captureError } = require('../../monitoring/sentry')
+const log = require('../../lib/logger')
+const sanitizeHtml = require('sanitize-html')
+
+const BOOK_DESCRIPTION_TRANSFORM = sanitizeHtml.simpleTransform(
+  'a',
+  { rel: 'noopener noreferrer', target: '_blank' },
+  true,
+)
+
+function sanitizeBookDescription(description) {
+  if (!description || typeof description !== 'string') return null
+
+  const sanitized = sanitizeHtml(description, {
+    allowedTags: [
+      'p',
+      'br',
+      'strong',
+      'em',
+      'b',
+      'i',
+      'u',
+      's',
+      'ul',
+      'ol',
+      'li',
+      'blockquote',
+      'a',
+    ],
+    allowedAttributes: {
+      a: ['href', 'target', 'rel'],
+    },
+    allowedSchemes: ['http', 'https', 'mailto'],
+    transformTags: {
+      a: BOOK_DESCRIPTION_TRANSFORM,
+    },
+  }).trim()
+
+  return sanitized || null
+}
+
+function createHttpStatusError(message, statusCode) {
+  const error = new Error(message)
+  error.status = statusCode
+  error.statusCode = statusCode
+  return error
+}
+
+/** Fetch with a timeout. Rejects if the response takes longer than `ms`. */
+function fetchWithTimeout(url, ms = 10000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ms)
+  return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
+}
+
+/** Fetch with one automatic retry on network/timeout failure. */
+async function fetchWithRetry(url, ms = 10000) {
+  try {
+    return await fetchWithTimeout(url, ms)
+  } catch (err) {
+    if (err.name === 'AbortError' || err.code === 'ECONNRESET' || err.code === 'ENOTFOUND') {
+      return fetchWithTimeout(url, ms)
+    }
+    throw err
+  }
+}
+
+/**
+ * Transform a Google Books volume item into our normalized book format.
+ * @param {object} item - Google Books API volume item
+ * @returns {object} Normalized book object
+ */
+function normalizeVolume(item) {
+  if (!item) return null
+  const info = item.volumeInfo || {}
+  const accessInfo = item.accessInfo || {}
+  return {
+    volumeId: item.id,
+    title: info.title || 'Untitled',
+    authors: info.authors || [],
+    categories: info.categories || [],
+    language: info.language || 'en',
+    pageCount: info.pageCount || 0,
+    coverUrl: info.imageLinks
+      ? info.imageLinks.thumbnail || info.imageLinks.smallThumbnail || null
+      : null,
+    previewLink: info.previewLink || null,
+    description: sanitizeBookDescription(info.description),
+    publishedDate: info.publishedDate || null,
+    averageRating: info.averageRating || null,
+    ratingsCount: info.ratingsCount || 0,
+    publisher: info.publisher || null,
+    // Access info for the embedded viewer
+    viewability: accessInfo.viewability || 'NO_PAGES',
+    embeddable: accessInfo.embeddable || false,
+    webReaderLink: accessInfo.webReaderLink || null,
+  }
+}
+
+/**
+ * Search for books on Google Books API.
+ * @param {string} query - Search term (title, author, etc.)
+ * @param {number} page - Page number (1-indexed)
+ * @param {object} filters - Optional filters (category, sort, language)
+ * @returns {Promise<object>} Search results
+ */
+// Per-query memo of how deep Google Books actually serves results before
+// returning empty pages. Google's API reports a `totalItems` of tens of
+// thousands but in practice gates deep pagination around startIndex 200-400
+// for many category-only queries. We learn this empirically: when TWO
+// consecutive page > 1 requests come back with empty `items`, we record the
+// last reachable page and answer subsequent higher-page requests with
+// `{ endOfResults: true }` instead of round-tripping to Google again.
+//
+// Two-strike rule: a single empty 200 OK can be a transient Google partial-
+// index window; only after a second empty response do we suppress further
+// upstream calls.
+//
+// Bound + LRU: novel `(query, filters)` tuples write entries that live 15
+// minutes; an attacker hitting `/api/library/search?search=<random>&page=2`
+// otherwise fills memory. MAX_MEMO_ENTRIES caps total size; oldest entries
+// are evicted when full.
+const LAST_REACHABLE_TTL_MS = 15 * 60 * 1000
+const MAX_MEMO_ENTRIES = 5000
+const LAST_REACHABLE_PAGE = new Map()
+
+function canonicalFilterKey(filters) {
+  // Object.keys insertion order shifts when the controller builds filters
+  // conditionally; canonicalize so `?cat=X&sort=Y` and `?sort=Y&cat=X`
+  // produce the same memo key.
+  if (!filters || typeof filters !== 'object') return '{}'
+  const sortedKeys = Object.keys(filters).sort()
+  const ordered = {}
+  for (const k of sortedKeys) ordered[k] = filters[k]
+  return JSON.stringify(ordered)
+}
+
+function lastReachableKey(query, filters) {
+  return `${query || ''}|${canonicalFilterKey(filters)}`
+}
+
+function evictOldestIfFull() {
+  if (LAST_REACHABLE_PAGE.size < MAX_MEMO_ENTRIES) return
+  // Map preserves insertion order — first key is oldest write. Evict ~10%
+  // at once so this stays O(1) amortized rather than firing every set.
+  let toEvict = Math.max(1, Math.floor(MAX_MEMO_ENTRIES / 10))
+  for (const k of LAST_REACHABLE_PAGE.keys()) {
+    LAST_REACHABLE_PAGE.delete(k)
+    if (--toEvict <= 0) break
+  }
+}
+
+function recordEmptyPageHit(query, filters, page) {
+  const key = lastReachableKey(query, filters)
+  const existing = LAST_REACHABLE_PAGE.get(key)
+  const lastReachable = page - 1
+  // Two-strike confirmation: a single empty 200 OK can be a transient
+  // Google partial-index window, so the first hit only TENTATIVELY records
+  // a cap. The second hit confirms the cap.
+  //
+  // Naive "same lastReachable twice" never fires during forward pagination
+  // because clicking page 11 then page 12 produces lastReachable=10 then
+  // lastReachable=11 — different values (Copilot review, 2026-05-03).
+  // Fix: confirm whenever a tentative entry already exists for this query,
+  // even if at a different boundary. Two separate empty pages > 1 are
+  // strong evidence the cap is real, and the smaller of the two is the
+  // honest answer (Google may serve up to N items but not page N+1, so the
+  // earlier empty page wins).
+  if (existing) {
+    const cap = Math.min(existing.lastReachable, lastReachable)
+    if (!existing.confirmed) {
+      LAST_REACHABLE_PAGE.set(key, {
+        lastReachable: cap,
+        recordedAt: Date.now(),
+        confirmed: true,
+      })
+      try {
+        const log = require('../../lib/logger')
+        log.info(
+          {
+            event: 'library.cap_discovered',
+            query: query || null,
+            filters: filters || null,
+            cap,
+          },
+          'Library deep-paging cap discovered',
+        )
+      } catch {
+        /* logger optional */
+      }
+    } else if (lastReachable < existing.lastReachable) {
+      // Already confirmed, but a new empty page tightened the cap — adopt
+      // the smaller value so the user does not bounce to a page we now
+      // know is empty.
+      LAST_REACHABLE_PAGE.set(key, {
+        lastReachable: cap,
+        recordedAt: Date.now(),
+        confirmed: true,
+      })
+    }
+    return true
+  }
+  evictOldestIfFull()
+  LAST_REACHABLE_PAGE.set(key, {
+    lastReachable,
+    recordedAt: Date.now(),
+    confirmed: false,
+  })
+  return false
+}
+
+function getLastReachablePage(query, filters) {
+  const key = lastReachableKey(query, filters)
+  const entry = LAST_REACHABLE_PAGE.get(key)
+  if (!entry) return null
+  if (Date.now() - entry.recordedAt > LAST_REACHABLE_TTL_MS) {
+    LAST_REACHABLE_PAGE.delete(key)
+    return null
+  }
+  // Only short-circuit on confirmed caps (≥2 consecutive empties).
+  if (!entry.confirmed) return null
+  return entry.lastReachable
+}
+
+async function searchBooks(query, page = 1, filters = {}) {
+  const cacheKey = `search:${query || ''}:${page}:${JSON.stringify(filters)}`
+  const cached = cache.get(cacheKey)
+  if (cached) return cached
+
+  // Short-circuit: if a previous request already discovered the deep-paging
+  // cap for this query, don't bother Google again with pages we know are
+  // empty. Returns the same shape the empty-result branch produces below.
+  const cappedAt = getLastReachablePage(query, filters)
+  if (cappedAt !== null && page > cappedAt) {
+    return {
+      results: [],
+      count: cappedAt * DEFAULT_PAGE_SIZE,
+      endOfResults: true,
+      lastReachablePage: cappedAt,
+    }
+  }
+
+  try {
+    const params = new URLSearchParams()
+
+    // Build the query string
+    let q = query && query.trim() ? query.trim() : ''
+    if (filters.category) {
+      q = q ? `${q}+subject:${filters.category}` : `subject:${filters.category}`
+    }
+    // If no query and no category, search for general popular books
+    if (!q) q = 'subject:fiction'
+    params.append('q', q)
+
+    // Pagination: Google Books uses startIndex (0-indexed) and maxResults
+    const startIndex = (page - 1) * DEFAULT_PAGE_SIZE
+    params.append('startIndex', startIndex)
+    params.append('maxResults', DEFAULT_PAGE_SIZE)
+
+    // Sort: Google Books supports 'relevance' (default) or 'newest'
+    if (filters.sort === 'newest') {
+      params.append('orderBy', 'newest')
+    } else {
+      params.append('orderBy', 'relevance')
+    }
+
+    // Language restriction
+    if (filters.language && filters.language !== 'all') {
+      params.append('langRestrict', filters.language)
+    }
+
+    // Filter to only show books (not magazines)
+    params.append('printType', 'books')
+
+    // Prefer books with preview available
+    if (filters.previewOnly) {
+      params.append('filter', 'partial')
+    }
+
+    if (GOOGLE_BOOKS_API_KEY) {
+      params.append('key', GOOGLE_BOOKS_API_KEY)
+    }
+
+    const url = `${GOOGLE_BOOKS_BASE}/volumes?${params.toString()}`
+    const response = await fetchWithRetry(url)
+
+    if (!response.ok) {
+      // Google Books occasionally returns 5xx under load. If our cached
+      // fallback has data, users don't see a degraded experience, so skip
+      // the Sentry capture to keep that signal meaningful.
+      const fallback = await searchCachedBooks(query, page, filters)
+      if (fallback && fallback.results && fallback.results.length > 0) {
+        fallback._source = 'cache'
+        return fallback
+      }
+      captureError(
+        createHttpStatusError(`Google Books search failed: ${response.status}`, response.status),
+        {
+          context: 'searchBooks',
+          query,
+          page,
+          statusCode: response.status,
+          fallbackAvailable: false,
+        },
+      )
+      return { results: [], count: 0, _unavailable: true }
+    }
+
+    const data = await response.json()
+    const results = (data.items || []).map(normalizeVolume)
+    const upstreamTotal = data.totalItems || 0
+
+    // Empty page on page > 1 ⇒ we hit Google Books' deep-paging soft cap.
+    // Cap totalCount at the last successful page so the frontend can render
+    // accurate pagination instead of "Page 11 of 2500" with zero results.
+    if (results.length === 0 && page > 1) {
+      const confirmed = recordEmptyPageHit(query, filters, page)
+      // After confirmation, the memo holds the AUTHORITATIVE cap, which
+      // can be smaller than `page - 1` (e.g. page 11 empty + page 12
+      // empty confirms cap = 10, not 11). Read the memo back so the
+      // frontend bounces to the page we actually know is non-empty.
+      // (Copilot review 2026-05-03.)
+      const memoCap = getLastReachablePage(query, filters)
+      const effectiveCap = confirmed && memoCap !== null ? memoCap : page - 1
+      // Surface endOfResults to the client only when confirmed (2 strikes).
+      // First-strike: respond with empty results but DON'T flag endOfResults
+      // so the user / prefetch can retry once before the cap is permanent.
+      const result = {
+        results: [],
+        count: confirmed ? effectiveCap * DEFAULT_PAGE_SIZE : page * DEFAULT_PAGE_SIZE,
+        endOfResults: confirmed,
+        lastReachablePage: confirmed ? effectiveCap : null,
+      }
+      // Don't cache the empty page itself — the cap memo handles repeat hits.
+      return result
+    }
+
+    // Cap upstreamTotal: if Google reports 50k results but we know from the
+    // memo that this query only reaches `cappedAt` pages, trust the memo.
+    const memoCap = getLastReachablePage(query, filters)
+    const totalCount =
+      memoCap !== null ? Math.min(upstreamTotal, memoCap * DEFAULT_PAGE_SIZE) : upstreamTotal
+
+    const result = { results, count: totalCount }
+    cache.set(cacheKey, result, CACHE_TTL.SEARCH)
+    return result
+  } catch (err) {
+    const fallback = await searchCachedBooks(query, page, filters)
+    if (fallback && fallback.results && fallback.results.length > 0) {
+      fallback._source = 'cache'
+      return fallback
+    }
+    captureError(err, { context: 'searchBooks', query, page, fallbackAvailable: false })
+    return { results: [], count: 0, _unavailable: true }
+  }
+}
+
+/**
+ * Get detailed information about a single book from Google Books API.
+ * @param {string} volumeId - Google Books volume ID
+ * @returns {Promise<object|null>} Book details or null on error
+ */
+async function getBookDetail(volumeId) {
+  const cacheKey = `book:${volumeId}`
+  const cached = cache.get(cacheKey)
+  if (cached) return cached
+
+  try {
+    const params = new URLSearchParams()
+    if (GOOGLE_BOOKS_API_KEY) {
+      params.append('key', GOOGLE_BOOKS_API_KEY)
+    }
+
+    const url = `${GOOGLE_BOOKS_BASE}/volumes/${volumeId}?${params.toString()}`
+    const response = await fetchWithRetry(url)
+
+    if (!response.ok) {
+      const cached = await getCachedBookDetail(volumeId)
+      if (cached) return cached
+      captureError(
+        createHttpStatusError(
+          `Google Books detail fetch failed: ${response.status}`,
+          response.status,
+        ),
+        {
+          context: 'getBookDetail',
+          volumeId,
+          statusCode: response.status,
+          fallbackAvailable: false,
+        },
+      )
+      return null
+    }
+
+    const data = await response.json()
+    const book = normalizeVolume(data)
+
+    cache.set(cacheKey, book, CACHE_TTL.BOOK_DETAIL)
+    return book
+  } catch (err) {
+    const cached = await getCachedBookDetail(volumeId)
+    if (cached) return cached
+    captureError(err, { context: 'getBookDetail', volumeId, fallbackAvailable: false })
+    return null
+  }
+}
+
+/**
+ * Get a single book from the CachedBook database table (fallback when Google Books is down).
+ * @param {string} volumeId
+ * @returns {Promise<object|null>}
+ */
+async function getCachedBookDetail(volumeId) {
+  const prismaClient = require('../../lib/prisma')
+  try {
+    const book = await prismaClient.cachedBook.findUnique({
+      where: { volumeId },
+    })
+    if (!book) return null
+    return {
+      volumeId: book.volumeId,
+      title: book.title,
+      authors: book.authors,
+      categories: book.categories,
+      language: book.language,
+      pageCount: book.pageCount,
+      coverUrl: book.coverUrl,
+      previewLink: book.previewLink,
+      description: sanitizeBookDescription(book.description),
+      publishedDate: book.publishedDate,
+      _source: 'cache',
+    }
+  } catch (err) {
+    captureError(err, { context: 'getCachedBookDetail', volumeId })
+    return null
+  }
+}
+
+/**
+ * Search cached books from the database (fallback when Google Books is slow/down).
+ */
+async function searchCachedBooks(query, page = 1, filters = {}) {
+  const prismaClient = require('../../lib/prisma')
+  const pageSize = DEFAULT_PAGE_SIZE
+  const skip = (page - 1) * pageSize
+
+  const where = {}
+  if (query && query.trim()) {
+    where.title = { contains: query.trim(), mode: 'insensitive' }
+  }
+  if (filters.language && filters.language !== 'all') {
+    where.language = filters.language
+  }
+  if (filters.category) {
+    where.categories = { string_contains: filters.category }
+  }
+
+  const orderBy = filters.sort === 'newest' ? { publishedDate: 'desc' } : { pageCount: 'desc' }
+
+  try {
+    const [books, count] = await Promise.all([
+      prismaClient.cachedBook.findMany({ where, orderBy, skip, take: pageSize }),
+      prismaClient.cachedBook.count({ where }),
+    ])
+
+    return {
+      results: books.map((b) => ({
+        volumeId: b.volumeId,
+        title: b.title,
+        authors: b.authors,
+        categories: b.categories,
+        language: b.language,
+        pageCount: b.pageCount,
+        coverUrl: b.coverUrl,
+        previewLink: b.previewLink,
+        description: sanitizeBookDescription(b.description),
+        publishedDate: b.publishedDate,
+      })),
+      count,
+    }
+  } catch (err) {
+    captureError(err, { context: 'searchCachedBooks' })
+    return null
+  }
+}
+
+/**
+ * Sync popular books from Google Books to the CachedBook table.
+ * Called periodically or on admin trigger.
+ * Fetches books across popular categories to build a local cache.
+ */
+async function syncPopularBooksToDB(maxPages = 3) {
+  const prismaClient = require('../../lib/prisma')
+  let synced = 0
+
+  const categoriesToSync = [
+    'Fiction',
+    'Science',
+    'History',
+    'Biography & Autobiography',
+    'Mathematics',
+    'Philosophy',
+  ]
+
+  for (const category of categoriesToSync) {
+    for (let page = 0; page < maxPages; page++) {
+      try {
+        const params = new URLSearchParams()
+        params.append('q', `subject:${category}`)
+        params.append('startIndex', page * DEFAULT_PAGE_SIZE)
+        params.append('maxResults', DEFAULT_PAGE_SIZE)
+        params.append('orderBy', 'relevance')
+        params.append('langRestrict', 'en')
+        params.append('printType', 'books')
+        if (GOOGLE_BOOKS_API_KEY) {
+          params.append('key', GOOGLE_BOOKS_API_KEY)
+        }
+
+        const url = `${GOOGLE_BOOKS_BASE}/volumes?${params.toString()}`
+        const response = await fetchWithTimeout(url, 10000)
+        if (!response.ok) continue
+        const data = await response.json()
+        if (!data.items || data.items.length === 0) break
+
+        for (const item of data.items) {
+          try {
+            const book = normalizeVolume(item)
+            if (!book || !book.volumeId) continue
+
+            await prismaClient.cachedBook.upsert({
+              where: { volumeId: book.volumeId },
+              update: {
+                title: book.title,
+                authors: book.authors || [],
+                categories: book.categories || [],
+                language: book.language || 'en',
+                pageCount: book.pageCount || 0,
+                coverUrl: book.coverUrl,
+                previewLink: book.previewLink,
+                description: book.description,
+                publishedDate: book.publishedDate,
+                syncedAt: new Date(),
+              },
+              create: {
+                volumeId: book.volumeId,
+                title: book.title,
+                authors: book.authors || [],
+                categories: book.categories || [],
+                language: book.language || 'en',
+                pageCount: book.pageCount || 0,
+                coverUrl: book.coverUrl,
+                previewLink: book.previewLink,
+                description: book.description,
+                publishedDate: book.publishedDate,
+              },
+            })
+            synced++
+          } catch {
+            // Skip individual book upsert errors
+          }
+        }
+
+        // Delay between pages to respect rate limits
+        await new Promise((r) => setTimeout(r, 500))
+      } catch {
+        // Continue on page fetch errors
+      }
+    }
+  }
+
+  log.warn({ event: 'library.sync_complete', synced }, 'Library popular books synced')
+  return synced
+}
+
+/**
+ * Pre-warm the cache with popular books on server startup.
+ * Lighter version of syncPopularBooksToDB -- just fills the in-memory cache.
+ */
+async function preloadPopularBooks() {
+  const prismaClient = require('../../lib/prisma')
+  let fetched = 0
+
+  const categoriesToPreload = ['Fiction', 'Science', 'History']
+  for (const category of categoriesToPreload) {
+    try {
+      const params = new URLSearchParams()
+      params.append('q', `subject:${category}`)
+      params.append('startIndex', 0)
+      params.append('maxResults', DEFAULT_PAGE_SIZE)
+      params.append('orderBy', 'relevance')
+      params.append('langRestrict', 'en')
+      params.append('printType', 'books')
+      if (GOOGLE_BOOKS_API_KEY) {
+        params.append('key', GOOGLE_BOOKS_API_KEY)
+      }
+
+      const url = `${GOOGLE_BOOKS_BASE}/volumes?${params.toString()}`
+      const response = await fetchWithTimeout(url, 15000)
+      if (!response.ok) continue
+      const data = await response.json()
+
+      const results = (data.items || []).map(normalizeVolume)
+      const cacheKey = `search:subject:${category}:1:${JSON.stringify({ category })}`
+      cache.set(cacheKey, { results, count: data.totalItems || 0 }, CACHE_TTL.SEARCH * 24)
+
+      // Also persist to CachedBook table
+      for (const book of results) {
+        try {
+          if (!book || !book.volumeId) continue
+          await prismaClient.cachedBook.upsert({
+            where: { volumeId: book.volumeId },
+            update: {
+              title: book.title,
+              authors: book.authors || [],
+              categories: book.categories || [],
+              language: book.language || 'en',
+              pageCount: book.pageCount || 0,
+              coverUrl: book.coverUrl,
+              previewLink: book.previewLink,
+              description: book.description,
+              publishedDate: book.publishedDate,
+              syncedAt: new Date(),
+            },
+            create: {
+              volumeId: book.volumeId,
+              title: book.title,
+              authors: book.authors || [],
+              categories: book.categories || [],
+              language: book.language || 'en',
+              pageCount: book.pageCount || 0,
+              coverUrl: book.coverUrl,
+              previewLink: book.previewLink,
+              description: book.description,
+              publishedDate: book.publishedDate,
+            },
+          })
+          fetched++
+        } catch {
+          // Skip individual book errors
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 500))
+    } catch {
+      // Silent failure -- preloading is best-effort
+    }
+  }
+  log.info({ event: 'library.prewarm_complete', fetched }, 'Popular books cache pre-warmed')
+}
+
+module.exports = {
+  searchBooks,
+  getBookDetail,
+  getCachedBookDetail,
+  preloadPopularBooks,
+  syncPopularBooksToDB,
+  searchCachedBooks,
+  normalizeVolume,
+}

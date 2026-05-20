@@ -1,0 +1,353 @@
+const express = require('express')
+const prisma = require('../../core/db/prisma')
+const { captureError } = require('../../core/monitoring/sentry')
+const requireAuth = require('../../core/auth/requireAuth')
+const requireVerifiedEmail = require('../../core/auth/requireVerifiedEmail')
+const { validateHtmlForSubmission, RISK_TIER } = require('../../lib/html/htmlSecurity')
+const { scanHtmlContentForPersistence } = require('../../lib/html/htmlDraftValidation')
+const { isModerationEnabled, scanContent } = require('../../lib/moderation/moderationEngine')
+const { updateFingerprint } = require('../../lib/plagiarismService')
+const { findSimilarSheets } = require('../../lib/plagiarism')
+const { createNotification } = require('../../lib/notify')
+const { runPlagiarismScan } = require('../plagiarism/plagiarism.service')
+const { createProvenanceToken } = require('../../lib/provenance')
+const { isHtmlUploadsEnabled } = require('../../lib/html/htmlKillSwitch')
+const { SHEET_STATUS, AUTHOR_SELECT, sheetWriteLimiter } = require('./sheets.constants')
+const { extractPreviewText } = require('../../lib/sheets/extractPreviewText')
+const { getUserTier } = require('../../lib/getUserPlan')
+const { PLANS } = require('../payments/payments.constants')
+const { trackActivity } = require('../../lib/activityTracker')
+const { EVENTS, trackServerEvent } = require('../../lib/events')
+const { runAbuseChecks } = require('../../lib/abuseDetection')
+const {
+  checkAndAwardBadgesLegacy: checkAndAwardBadges,
+  emitAchievementEvent,
+  EVENT_KINDS,
+} = require('../achievements')
+const {
+  resolveNextSheetStatus,
+  normalizeContentFormat,
+  getUserDefaultDownloads,
+} = require('./sheets.service')
+const { serializeSheet } = require('./sheets.serializer')
+const log = require('../../lib/logger')
+
+const { sendError, ERROR_CODES } = require('../../middleware/errorEnvelope')
+const router = express.Router()
+
+router.post('/', requireAuth, requireVerifiedEmail, sheetWriteLimiter, async (req, res) => {
+  const { title, content, courseId, forkOf, description, allowDownloads, source } = req.body || {}
+  const contentFormat = normalizeContentFormat(req.body?.contentFormat)
+  // Accept both `hub_ai` (engine canonical) and `hub-ai` (the frontend
+  // navigation-state marker emitted by AiSheetPreview) so a future client
+  // tweak that forwards `source` verbatim still triggers AI_PUBLISH_SHEET.
+  const isHubAiSource = typeof source === 'string' && /^hub[-_]ai$/i.test(source.trim())
+  const nextStatus = resolveNextSheetStatus({
+    requestedStatus: req.body?.status,
+    contentFormat,
+    user: req.user,
+  })
+
+  if (!title?.trim()) return sendError(res, 400, 'Title is required.', ERROR_CODES.BAD_REQUEST)
+  if (!content?.trim()) return sendError(res, 400, 'Content is required.', ERROR_CODES.BAD_REQUEST)
+  if (!courseId) return sendError(res, 400, 'Course is required.', ERROR_CODES.BAD_REQUEST)
+
+  try {
+    /* Check upload quota based on user tier (free/donor/pro) */
+    const tier = await getUserTier(req.user.userId)
+    const tierConfig = PLANS[tier] || PLANS.free
+    const limit = tierConfig.uploadsPerMonth
+    if (limit !== -1) {
+      const startOfMonth = new Date()
+      startOfMonth.setDate(1)
+      startOfMonth.setHours(0, 0, 0, 0)
+
+      try {
+        const monthlyCount = await prisma.studySheet.count({
+          where: {
+            userId: req.user.userId,
+            createdAt: { gte: startOfMonth },
+          },
+        })
+
+        if (monthlyCount >= limit) {
+          // Notify the user with a durable record + upsell link. Dedupe
+          // by the calendar month so a user who hits the cap multiple
+          // times in the same month only gets one notification.
+          createNotification(prisma, {
+            userId: req.user.userId,
+            type: 'upload_quota_reached',
+            message: `You've used all ${limit} sheet uploads this month. Upgrade to Pro for unlimited uploads.`,
+            linkPath: '/pricing',
+            priority: 'medium',
+            dedupKey: `upload_quota_reached:${req.user.userId}:${startOfMonth.getFullYear()}-${startOfMonth.getMonth() + 1}`,
+          }).catch(() => {})
+          return sendError(
+            res,
+            403,
+            `Monthly upload limit reached (${limit}). Upgrade to Pro for unlimited uploads.`,
+            'UPLOAD_LIMIT',
+          )
+        }
+      } catch {
+        // If quota check fails, gracefully degrade and allow the upload
+      }
+    }
+
+    let htmlScanFields = null
+    if (contentFormat === 'html') {
+      const killSwitch = await isHtmlUploadsEnabled()
+      if (!killSwitch.enabled) {
+        return sendError(
+          res,
+          403,
+          'HTML uploads are temporarily disabled. Please use Markdown instead.',
+          'HTML_UPLOADS_DISABLED',
+        )
+      }
+      const validation = validateHtmlForSubmission(content)
+      if (!validation.ok) {
+        return sendError(res, 400, validation.issues[0], ERROR_CODES.VALIDATION, {
+          issues: validation.issues,
+        })
+      }
+      htmlScanFields = await scanHtmlContentForPersistence(content)
+    }
+
+    /* Use user's defaultDownloads preference when not explicitly set in request */
+    const resolvedAllowDownloads =
+      typeof allowDownloads === 'boolean'
+        ? allowDownloads
+        : await getUserDefaultDownloads(req.user.userId)
+
+    /* If a forkOf parent is claimed, verify it refers to a real published sheet.
+     * Without this check, an attacker could claim any sheet ID as their parent,
+     * which would silently exclude that lineage from the plagiarism scanner —
+     * effectively whitelisting their content against the most-similar real
+     * source. This complements the validation already done by /sheets/:id/fork.
+     * Forks of own sheets are allowed. */
+    let validatedForkOf = null
+    if (forkOf) {
+      const candidate = Number.parseInt(forkOf, 10)
+      if (!Number.isInteger(candidate) || candidate <= 0) {
+        return sendError(res, 400, 'Invalid fork source.', ERROR_CODES.BAD_REQUEST)
+      }
+      const source = await prisma.studySheet.findUnique({
+        where: { id: candidate },
+        select: { id: true, status: true },
+      })
+      if (!source || source.status !== SHEET_STATUS.PUBLISHED) {
+        return sendError(
+          res,
+          400,
+          'Fork source must be an existing published sheet.',
+          ERROR_CODES.BAD_REQUEST,
+        )
+      }
+      validatedForkOf = candidate
+    }
+
+    const trimmedContent = content.trim()
+    const sheet = await prisma.studySheet.create({
+      data: {
+        title: title.trim().slice(0, 160),
+        description: description?.trim().slice(0, 300) || '',
+        previewText: extractPreviewText(trimmedContent),
+        content: trimmedContent,
+        contentFormat,
+        status:
+          htmlScanFields?.htmlRiskTier === RISK_TIER.QUARANTINED
+            ? SHEET_STATUS.QUARANTINED
+            : nextStatus,
+        courseId: Number.parseInt(courseId, 10),
+        userId: req.user.userId,
+        forkOf: validatedForkOf,
+        allowDownloads: resolvedAllowDownloads,
+        ...(htmlScanFields || {}),
+      },
+      include: {
+        author: { select: AUTHOR_SELECT },
+        course: { include: { school: true } },
+        htmlVersions: true,
+      },
+    })
+
+    trackActivity(prisma, req.user.userId, 'sheets')
+    checkAndAwardBadges(prisma, req.user.userId)
+    // Achievements V2 — emit a typed event so early-bird / night-owl / polyglot
+    // criteria can match against hour + lang metadata. Fire-and-forget; failures
+    // never bubble back to the response.
+    if (sheet.status === SHEET_STATUS.PUBLISHED) {
+      const hour = new Date().getHours()
+      // Loop-3 finding F-E: void prefix matches the canonical fire-and-forget
+      // form used by the notes / groups / AI trigger sites. The engine wraps
+      // its own body in try/catch so an unwrapped rejection is impossible
+      // today, but `void` is defensive against future engine changes.
+      void emitAchievementEvent(prisma, req.user.userId, EVENT_KINDS.SHEET_PUBLISH, {
+        hour,
+        sheetId: sheet.id,
+        courseId: sheet.courseId,
+      })
+      // Achievements V2 — AI-authored publishes also emit AI_PUBLISH_SHEET so
+      // the ai-author badge unlocks. Same fire-and-forget semantics.
+      if (isHubAiSource) {
+        void emitAchievementEvent(prisma, req.user.userId, EVENT_KINDS.AI_PUBLISH_SHEET, {
+          sheetId: sheet.id,
+          courseId: sheet.courseId,
+        })
+      }
+    }
+
+    // First-creation funnel event (Loop 5 finding F2). The count
+    // *after* the insert above is the authoritative "is this the
+    // user's first sheet" check — cheaper than a User.firstSheetAt
+    // column for v1. Surfaces a `firstCreation` flag on the response
+    // so the frontend can route into a celebration toast.
+    let firstCreation = false
+    try {
+      const sheetCount = await prisma.studySheet.count({
+        where: { userId: req.user.userId },
+      })
+      if (sheetCount === 1) {
+        firstCreation = true
+        trackServerEvent(req.user.userId, EVENTS.SHEET_FIRST_CREATED, {
+          sheetId: sheet.id,
+          status: sheet.status,
+          courseId: sheet.courseId,
+        })
+      }
+    } catch {
+      /* best effort — never block the create */
+    }
+
+    res.status(201).json({
+      ...serializeSheet(sheet),
+      firstCreation,
+      message:
+        sheet.status === SHEET_STATUS.PENDING_REVIEW
+          ? 'HTML sheet submitted for admin review.'
+          : sheet.status === SHEET_STATUS.QUARANTINED
+            ? 'HTML sheet quarantined for security review.'
+            : 'Sheet published.',
+    })
+
+    /* Async content moderation — scan title + description + markdown content */
+    if (isModerationEnabled()) {
+      const textToScan =
+        `${title} ${description || ''} ${contentFormat === 'markdown' ? content : ''}`.trim()
+      void scanContent({
+        contentType: 'sheet',
+        contentId: sheet.id,
+        text: textToScan,
+        userId: req.user.userId,
+      })
+    }
+
+    /* Abuse detection — rate anomaly, duplicate, new-account checks (fire-and-forget) */
+    void runAbuseChecks({
+      userId: req.user.userId,
+      actionType: 'sheet_create',
+      contentType: 'sheet',
+      contentId: sheet.id,
+      text: `${title} ${description || ''} ${content || ''}`.slice(0, 1000),
+    })
+
+    /* Content fingerprinting for plagiarism detection (fire-and-forget) */
+    void updateFingerprint('sheet', sheet.id, content)
+
+    /* Plagiarism check: find very similar sheets and create moderation case if needed (fire-and-forget) */
+    Promise.resolve().then(async () => {
+      try {
+        // Wait a brief moment for fingerprint to be computed
+        await new Promise((resolve) => setTimeout(resolve, 100))
+
+        const similarSheets = await findSimilarSheets(sheet.id, 5) // threshold=5 means ~92%+ similar
+        if (similarSheets && similarSheets.length > 0) {
+          const verySimialar = similarSheets.filter((s) => s.distance <= 5)
+          if (verySimialar.length > 0) {
+            log.info(
+              {
+                sheetId: sheet.id,
+                matchCount: verySimialar.length,
+                matches: verySimialar.slice(0, 3),
+              },
+              '[PLAGIARISM] very similar matches detected for sheet',
+            )
+
+            // Create a moderation case for manual review
+            try {
+              await prisma.moderationCase.create({
+                data: {
+                  contentType: 'sheet',
+                  contentId: sheet.id,
+                  userId: req.user.userId,
+                  status: 'pending',
+                  source: 'auto_plagiarism',
+                  category: 'plagiarism',
+                  reasonCategory: 'plagiarism',
+                  confidence: 0.95, // High confidence for simhash similarity
+                  excerpt: content.slice(0, 400),
+                  evidence: {
+                    similarSheets: verySimialar.map((s) => ({
+                      sheetId: s.sheetId,
+                      title: s.title,
+                      author: s.username,
+                      similarity: s.similarity,
+                      distance: s.distance,
+                    })),
+                    detectionMethod: 'simhash_similarity',
+                    threshold: 5,
+                  },
+                },
+              })
+            } catch (caseErr) {
+              captureError(caseErr, { context: 'plagiarism-case-create', sheetId: sheet.id })
+            }
+          }
+        }
+      } catch (err) {
+        captureError(err, { context: 'plagiarism-check', sheetId: sheet.id })
+      }
+    })
+
+    /* Phase 4: comprehensive plagiarism scan with multi-window SimHash + n-gram (fire-and-forget) */
+    void runPlagiarismScan(sheet.id, content, req.user.userId)
+
+    /* Auto-generate provenance manifest (fire-and-forget) */
+    Promise.resolve().then(async () => {
+      try {
+        const token = createProvenanceToken(
+          sheet.id,
+          req.user.userId,
+          content.trim(),
+          sheet.createdAt,
+        )
+        await prisma.provenanceManifest.upsert({
+          where: { sheetId: sheet.id },
+          update: {
+            originHash: token.originHash,
+            encryptedToken: token.encryptedToken,
+            algorithm: token.algorithm,
+            iv: token.iv,
+            authTag: token.authTag,
+          },
+          create: {
+            sheetId: sheet.id,
+            originHash: token.originHash,
+            encryptedToken: token.encryptedToken,
+            algorithm: token.algorithm,
+            iv: token.iv,
+            authTag: token.authTag,
+          },
+        })
+      } catch (err) {
+        captureError(err, { context: 'provenance.autoGenerate', sheetId: sheet.id })
+      }
+    })
+  } catch (error) {
+    captureError(error, { route: req.originalUrl, method: req.method })
+    sendError(res, 500, 'Server error.', ERROR_CODES.INTERNAL)
+  }
+})
+
+module.exports = router

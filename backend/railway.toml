@@ -1,0 +1,23 @@
+# railway.toml — backend service
+# Place this file in: studyhub/backend/railway.toml
+
+[build]
+builder = "nixpacks"
+buildCommand = "npm install && npx prisma generate"
+
+[deploy]
+# Migrations + FeatureFlag seeding are handled by `scripts/start.js` on
+# every boot (idempotent upserts; see CLAUDE.md §12 and decision #20).
+# Doing it in start.js — rather than relying on preDeployCommand —
+# means restarts, crash-recoveries, and Dockerfile-built deploys all
+# self-provision shipped flags without an operator running anything by
+# hand. preDeployCommand here only handles best-effort GeoIP refresh.
+preDeployCommand = "npm run update-geoip-db || echo '[pre-deploy] skipping geoip refresh'"
+startCommand = "npm start"
+healthcheckPath = "/health"
+healthcheckTimeout = 60
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10
+
+[[services]]
+name = "studyhub-api"

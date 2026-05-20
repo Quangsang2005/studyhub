@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="StudyHub — browse, upload, and collaborate on course study sheets with students at your school."
+    />
+    <meta name="theme-color" content="#2563eb" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="StudyHub" />
+    <meta property="og:title" content="StudyHub — The GitHub of Studying" />
+    <meta
+      property="og:description"
+      content="Fork study sheets, take practice tests, and collaborate with classmates. Free for students forever."
+    />
+    <meta property="og:url" content="https://getstudyhub.org" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="StudyHub — The GitHub of Studying" />
+    <meta
+      name="twitter:description"
+      content="Fork study sheets, collaborate with classmates. Free for students."
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/icon-256.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+      integrity="sha384-/o6I2CkkWC//PSjvWC/eYN7l3xM3tJm8ZzVkCOfp//W05QcE3mlGskpoHB6XqI+B"
+      crossorigin="anonymous"
+    />
+    <!-- Analytics + consent — Task #70 self-hosted cookie banner.
+         The Termly resource-blocker that used to live here was being
+         aggressively stripped by Chrome incognito / Brave / Safari /
+         Firefox-strict third-party-cookie blocking, so the consent
+         banner never persisted. The new banner is a React component
+         (components/CookieConsentBanner.jsx) backed by a localStorage
+         key (studyhub.cookieConsent). This block now does just two
+         things:
+           1. Detect the Capacitor native shell so we never load any
+              web-only analytics inside the mobile WebView.
+           2. Two-phase loader for Microsoft Clarity + Google Ads:
+              load IFF the user has explicitly accepted ALL cookies.
+              Listens for `studyhub:consent-changed` for the same-
+              session "Accept all" click, AND immediate-fires on page
+              load if a returning visitor already has 'all' stored.
+         Skip on native — same prior behavior. -->
+    <script type="text/javascript">
+      ;(function () {
+        // Detect Capacitor native shell — skip all web analytics/consent banners
+        var isNative =
+          window.location.protocol === 'capacitor:' ||
+          document.URL.indexOf('capacitor://') === 0 ||
+          // Capacitor WebView serves at http(s)://localhost/ with NO port.
+          // The web dev server is http://localhost:5173, so gate on port === ''.
+          ((window.location.protocol === 'https:' || window.location.protocol === 'http:') &&
+            window.location.hostname === 'localhost' &&
+            window.location.port === '') ||
+          navigator.userAgent.indexOf('StudyHub') > -1
+        if (isNative) {
+          window.__SH_NATIVE__ = true
+          return
+        }
+
+        // Idempotent loader — guarded so a stray duplicate consent
+        // event can't double-load Clarity / gtag.
+        var analyticsLoaded = false
+        function loadAnalytics() {
+          if (analyticsLoaded) return
+          analyticsLoaded = true
+
+          // Microsoft Clarity
+          ;(function (c, l, a, r, i, t, y) {
+            c[a] =
+              c[a] ||
+              function () {
+                ;(c[a].q = c[a].q || []).push(arguments)
+              }
+            t = l.createElement(r)
+            t.async = 1
+            t.src = 'https://www.clarity.ms/tag/' + i
+            y = l.getElementsByTagName(r)[0]
+            y.parentNode.insertBefore(t, y)
+          })(window, document, 'clarity', 'script', 'vv9kfyhqe1')
+
+          // Google tag (gtag.js)
+          var gs = document.createElement('script')
+          gs.async = true
+          gs.src = 'https://www.googletagmanager.com/gtag/js?id=AW-18019301841'
+          document.head.appendChild(gs)
+          window.dataLayer = window.dataLayer || []
+          function gtag() {
+            window.dataLayer.push(arguments)
+          }
+          window.gtag = gtag
+          gtag('js', new Date())
+          gtag('config', 'AW-18019301841')
+        }
+
+        // Phase 1 — listen for the in-session "Accept all" click. The
+        // CookieConsentBanner dispatches this event from
+        // src/lib/cookieConsent.js → writeConsent('all').
+        window.addEventListener('studyhub:consent-changed', function (e) {
+          if (e && e.detail && e.detail.choice === 'all') loadAnalytics()
+        })
+
+        // Phase 2 — returning visitors who already accepted in a prior
+        // session get analytics fired on this load too. Read the same
+        // localStorage key the lib uses so the contract is single-
+        // sourced (any future schema change only lands in one file —
+        // src/lib/cookieConsent.js — and this string-comparison stays
+        // valid).
+        try {
+          var raw = localStorage.getItem('studyhub.cookieConsent')
+          if (raw) {
+            var parsed = JSON.parse(raw)
+            if (parsed && parsed.choice === 'all') loadAnalytics()
+          }
+        } catch (e) {
+          /* private-mode / disabled storage — banner re-prompts later */
+        }
+      })()
+    </script>
+    <title>StudyHub</title>
+    <script>
+      // Apply saved theme before React mounts to prevent light-mode flash
+      ;(function () {
+        try {
+          var t = localStorage.getItem('sh-theme') || 'system'
+          var dark =
+            t === 'dark' ||
+            (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) document.documentElement.setAttribute('data-theme', 'dark')
+        } catch (e) {}
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/runtime-config.js"></script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

@@ -1,0 +1,129 @@
+name: StudyHub CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: ['main', 'approved-branch']
+  push:
+    branches: ['main', 'approved-branch']
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      # fetch-depth: 0 so the release-log diff below can compute a merge
+      # base against the PR's base branch. With the default shallow
+      # checkout (depth=1), `git diff origin/main...HEAD` fails with
+      # "no merge base" on every dependabot PR — was the root cause of
+      # constantly-red dep PR CI as of 2026-05-01.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Enforce release log update
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Fetch the PR's base ref deeply enough that the merge base
+          # exists locally. `--unshallow` would also work but is a
+          # no-op when fetch-depth is already 0.
+          git fetch --no-tags origin "${{ github.base_ref }}"
+
+          CHANGED_FILES="$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)"
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # The internal log at docs/internal/beta-v*-release-log.md is gitignored
+          # by design (private team notes). The public-facing, tracked log at
+          # docs/release-log.md is the only file in the diff that can satisfy
+          # this gate. See docs/release-log.md for the contributor checklist.
+          CODE_CHANGED="$(printf '%s\n' "$CHANGED_FILES" | grep -E '^(backend/|frontend/|scripts/|\.github/workflows/|docker-compose\.yml|package\.json)' || true)"
+          RELEASE_LOG_CHANGED="$(printf '%s\n' "$CHANGED_FILES" | grep -E '^docs/release-log\.md$' || true)"
+
+          if [[ -n "$CODE_CHANGED" && -z "$RELEASE_LOG_CHANGED" ]]; then
+            echo "::error::Code changes detected without updating docs/release-log.md. Add a one-line entry under the current cycle heading."
+            exit 1
+          fi
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend/studyhub-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/studyhub-app/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+  playwright-smoke:
+    runs-on: ubuntu-latest
+    needs: frontend
+    defaults:
+      run:
+        working-directory: frontend/studyhub-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/studyhub-app/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e:smoke
+      - name: Upload Playwright Smoke Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-artifacts
+          path: |
+            frontend/studyhub-app/playwright-report
+            frontend/studyhub-app/test-results
+          if-no-files-found: ignore
+
+  playwright-a11y:
+    runs-on: ubuntu-latest
+    needs: frontend
+    defaults:
+      run:
+        working-directory: frontend/studyhub-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/studyhub-app/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e:a11y
+      - name: Upload Playwright A11y Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-a11y-artifacts
+          path: |
+            frontend/studyhub-app/playwright-report
+            frontend/studyhub-app/test-results
+          if-no-files-found: ignore

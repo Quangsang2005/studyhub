@@ -1,0 +1,867 @@
+import { Suspense, lazy, useEffect, useRef } from 'react'
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useParams } from 'react-router-dom'
+import { GoogleOAuthProvider } from '@react-oauth/google'
+import { trackPageView, identifyAuthenticatedUser, clearAuthenticatedUser } from './lib/telemetry'
+import { useBootstrapPreferences } from './lib/useBootstrapPreferences'
+import { useIdleTimeout } from './lib/useIdleTimeout'
+import RouteErrorBoundary from './components/RouteErrorBoundary'
+import { getAuthenticatedHomePath } from './lib/authNavigation'
+import { SessionProvider, useSession } from './lib/session-context'
+import { GOOGLE_CLIENT_ID } from './config'
+import { isNativePlatform } from './lib/mobile/detectMobile'
+import useAchievementUnlockListener from './features/achievements/useAchievementUnlockListener'
+
+const AppMobile = lazy(() => import('./mobile/App.mobile'))
+
+const HomePage = lazy(() => import('./pages/home/HomePage'))
+const LoginPage = lazy(() => import('./pages/auth/LoginPage'))
+const LoginChallengePage = lazy(() => import('./pages/auth/LoginChallengePage'))
+const RegisterScreen = lazy(() => import('./pages/auth/RegisterScreen'))
+const RolePickerPage = lazy(() => import('./pages/auth/RolePickerPage'))
+const TermsPage = lazy(() => import('./pages/legal/TermsPage'))
+const PrivacyPage = lazy(() => import('./pages/legal/PrivacyPage'))
+const GuidelinesPage = lazy(() => import('./pages/legal/GuidelinesPage'))
+const CookiePolicyPage = lazy(() => import('./pages/legal/CookiePolicyPage'))
+const DisclaimerPage = lazy(() => import('./pages/legal/DisclaimerPage'))
+const DataRequestPage = lazy(() => import('./pages/legal/DataRequestPage'))
+const FeedPage = lazy(() => import('./pages/feed/FeedPage'))
+const SheetsPage = lazy(() => import('./pages/sheets/SheetsPage'))
+// Design Refresh v2 — Week 2 new pages
+const TeachMaterialsPage = lazy(() => import('./pages/teach/TeachMaterialsPage'))
+const DocsPage = lazy(() => import('./pages/docs/DocsPage').then((m) => ({ default: m.default })))
+const DocsFeaturePage = lazy(() =>
+  import('./pages/docs/DocsPage').then((m) => ({ default: m.DocsFeaturePage })),
+)
+const SheetViewerPage = lazy(() => import('./pages/sheets/viewer/SheetViewerPage'))
+const AttachmentPreviewPage = lazy(() => import('./pages/preview/AttachmentPreviewPage'))
+const SheetHtmlPreviewPage = lazy(() => import('./pages/preview/SheetHtmlPreviewPage'))
+const UploadSheetPage = lazy(() => import('./pages/sheets/upload/UploadSheetPage'))
+const SettingsPage = lazy(() => import('./pages/settings/SettingsPage'))
+const Setup2FAPage = lazy(() => import('./pages/settings/Setup2FAPage'))
+const AdminPage = lazy(() => import('./pages/admin/AdminPage'))
+const AboutPage = lazy(() => import('./pages/legal/AboutPage'))
+const PricingPage = lazy(() => import('./pages/pricing/PricingPage'))
+const SupportersPage = lazy(() => import('./pages/supporters/SupportersPage'))
+const ForgotPasswordPage = lazy(() => import('./pages/auth/ForgotPasswordPage'))
+const ResetPasswordPage = lazy(() => import('./pages/auth/ResetPasswordPage'))
+const UserProfilePage = lazy(() => import('./pages/profile/UserProfilePage'))
+const TestsPage = lazy(() => import('./pages/tests/TestsPage'))
+const TestTakerPage = lazy(() => import('./pages/tests/TestTakerPage'))
+const NotesPage = lazy(() => import('./pages/notes/NotesPage'))
+const NoteViewerPage = lazy(() => import('./pages/notes/NoteViewerPage'))
+const AnnouncementsPage = lazy(() => import('./pages/announcements/AnnouncementsPage'))
+const NotificationsPage = lazy(() => import('./pages/notifications/NotificationsPage'))
+const SubmitPage = lazy(() => import('./pages/submit/SubmitPage'))
+const MyCoursesPage = lazy(() => import('./pages/courses/MyCoursesPage'))
+const SheetLabPage = lazy(() => import('./pages/sheets/lab/SheetLabPage'))
+const AiSheetSetupPage = lazy(() => import('./pages/sheets/lab/AiSheetSetupPage'))
+const MessagesPage = lazy(() => import('./pages/messages/MessagesPage'))
+const StudyGroupsPage = lazy(() => import('./pages/studyGroups/StudyGroupsPage'))
+const AiPage = lazy(() => import('./pages/ai/AiPage'))
+const LibraryPage = lazy(() => import('./pages/library/LibraryPage'))
+const BookDetailPage = lazy(() => import('./pages/library/BookDetailPage'))
+const BookReaderPage = lazy(() => import('./pages/library/BookReaderPage'))
+const ScholarPage = lazy(() => import('./pages/scholar/ScholarPage'))
+const ScholarSearchPage = lazy(() => import('./pages/scholar/ScholarSearchPage'))
+const ScholarPaperPage = lazy(() => import('./pages/scholar/ScholarPaperPage'))
+const ScholarSavedPage = lazy(() => import('./pages/scholar/ScholarSavedPage'))
+const ScholarTopicPage = lazy(() => import('./pages/scholar/ScholarTopicPage'))
+const PlaygroundPage = lazy(() => import('./pages/playground/PlaygroundPage'))
+const ReviewPage = lazy(() => import('./pages/review/ReviewPage'))
+const OnboardingPage = lazy(() => import('./pages/onboarding/OnboardingPage'))
+const InvitePage = lazy(() => import('./pages/invite/InvitePage'))
+const PlagiarismReportPage = lazy(() => import('./pages/plagiarism/PlagiarismReportPage'))
+const AchievementsPage = lazy(() => import('./features/achievements/AchievementsPage'))
+const AchievementDetailPage = lazy(() => import('./features/achievements/AchievementDetailPage'))
+const AchievementUnlockModal = lazy(() => import('./features/achievements/AchievementUnlockModal'))
+const NotFoundPage = lazy(() => import('./pages/NotFoundPage'))
+// Dev-only test harness for the Playwright focus-trap smoke spec.
+// Vite's `import.meta.env.DEV` is statically true in `npm run dev` and
+// statically false in `npm run build`, so the lazy() import is dead-
+// code-eliminated from production bundles.
+const FocusTrapHarnessPage = import.meta.env.DEV
+  ? lazy(() => import('./pages/dev/FocusTrapHarnessPage'))
+  : null
+
+import ScrollToTop from './components/ScrollToTop'
+import ToastContainer from './components/Toast'
+import FirstCreationCelebration from './components/FirstCreationCelebration'
+import AiPermissionDialog from './components/ai/AiPermissionDialog'
+import { AiPermissionProvider } from './lib/useAiPermission'
+import OfflineIndicator from './components/OfflineIndicator'
+import LegalAcceptanceEnforcementModal from './components/LegalAcceptanceEnforcementModal'
+import CookieConsentBanner from './components/CookieConsentBanner'
+import SwUpdateAutoReloader from './components/SwUpdateAutoReloader'
+import DarkModeFx from './components/DarkModeFx'
+import { ChatPanelProvider } from './lib/chatPanelContext.jsx'
+
+const AiBubble = lazy(() => import('./components/ai/AiBubble'))
+const AiChatProviderModule = lazy(() =>
+  import('./lib/AiChatProvider').then((m) => ({ default: m.AiChatProvider })),
+)
+
+const PerfOverlay = import.meta.env?.DEV ? lazy(() => import('./components/PerfOverlay')) : null
+
+// Achievements V2 — empty component that hosts the
+// useAchievementUnlockListener hook. Lives inside the
+// ChatPanelProvider/AuthenticatedAiProvider scope so the socket and
+// session contexts are available; renders nothing.
+function AchievementUnlockListenerBridge() {
+  useAchievementUnlockListener()
+  return null
+}
+
+function PublicRoute({ children }) {
+  const { user, isBootstrapping, isAuthenticated } = useSession()
+
+  if (isBootstrapping) return <RouteFallback />
+  if (!isAuthenticated || !user) return children
+  return <Navigate to={getAuthenticatedHomePath(user)} replace />
+}
+
+function PrivateRoute({ children }) {
+  const { isBootstrapping, isAuthenticated } = useSession()
+
+  if (isBootstrapping) return <RouteFallback />
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+
+  return <RouteErrorBoundary>{children}</RouteErrorBoundary>
+}
+
+function EditRedirect() {
+  const { id } = useParams()
+  return <Navigate to={`/sheets/${id}/lab`} replace />
+}
+
+function DashboardRedirect() {
+  const { user } = useSession()
+  if (!user) return <Navigate to="/login" replace />
+  return <Navigate to={`/users/${user.username}?tab=overview`} replace />
+}
+
+/* Route-change announcer for screen readers */
+const ROUTE_TITLES = {
+  '/': 'Home',
+  '/login': 'Sign In',
+  '/register': 'Create Account',
+  '/feed': 'Feed',
+  '/sheets': 'Study Sheets',
+  '/sheets/upload': 'Upload Sheet',
+  '/tests': 'Practice Tests',
+  '/notes': 'My Notes',
+  '/messages': 'Messages',
+  '/study-groups': 'Study Groups',
+  '/ai': 'Hub AI',
+  '/sheets/new/lab': 'Publish AI Sheet',
+  '/announcements': 'Announcements',
+  '/notifications': 'Notifications',
+  '/achievements': 'Achievements',
+  '/submit': 'Submit Request',
+  '/my-courses': 'My Courses',
+  '/admin': 'Admin',
+  '/dashboard': 'My Profile',
+  '/settings': 'Settings',
+  '/terms': 'Terms of Service',
+  '/privacy': 'Privacy Policy',
+  '/guidelines': 'Community Guidelines',
+  '/about': 'About',
+  '/invite': 'Invite Classmates',
+  '/pricing': 'Pricing',
+  '/library': 'Library',
+  '/scholar': 'Scholar',
+  '/scholar/search': 'Scholar search',
+  '/scholar/saved': 'Saved papers',
+  '/playground': 'Code Playground',
+  '/review': 'Leave a Review',
+  '/onboarding': 'Onboarding',
+  '/forgot-password': 'Forgot Password',
+  '/reset-password': 'Reset Password',
+}
+
+const HOME_CONNECTED_FX_ROUTES = new Set(['/', '/terms', '/privacy', '/guidelines', '/about'])
+
+function RouteVisualScope({ children }) {
+  const location = useLocation()
+  const enablePublicFx = HOME_CONNECTED_FX_ROUTES.has(location.pathname)
+
+  return (
+    <div className={enablePublicFx ? 'sh-public-route-fx' : undefined}>
+      {enablePublicFx ? <DarkModeFx /> : null}
+      {children}
+    </div>
+  )
+}
+
+function RouteAnnouncer() {
+  const location = useLocation()
+  const announcerRef = useRef(null)
+
+  useEffect(() => {
+    const title = ROUTE_TITLES[location.pathname] || 'Page'
+    if (announcerRef.current) {
+      announcerRef.current.textContent = `Navigated to ${title}`
+    }
+  }, [location.pathname])
+
+  return (
+    <div
+      ref={announcerRef}
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      className="sr-only"
+    />
+  )
+}
+
+function RouteTelemetry() {
+  const location = useLocation()
+  const { user } = useSession()
+
+  useEffect(() => {
+    const nextPath = `${location.pathname}${location.search}`
+    trackPageView(nextPath)
+  }, [location.pathname, location.search])
+
+  useEffect(() => {
+    if (!user) {
+      clearAuthenticatedUser()
+      return
+    }
+    identifyAuthenticatedUser(user)
+  }, [user])
+
+  return null
+}
+
+/**
+ * Loads and applies saved theme + font size preferences on first auth.
+ * Runs once after login, then applies from cache on subsequent page loads.
+ */
+function PreferencesBootstrap() {
+  useBootstrapPreferences()
+
+  const { isAuthenticated, signOut } = useSession()
+  useIdleTimeout(
+    () => {
+      void signOut()
+    },
+    { enabled: isAuthenticated, timeoutMs: 30 * 60 * 1000 },
+  )
+
+  return null
+}
+
+function RouteFallback() {
+  return (
+    <div style={{ minHeight: '100vh', background: 'var(--sh-bg, #f8fafc)' }}>
+      {/* Navbar skeleton */}
+      <div
+        style={{
+          height: 56,
+          background: 'var(--sh-surface, #fff)',
+          borderBottom: '1px solid var(--sh-border, #e2e8f0)',
+          display: 'flex',
+          alignItems: 'center',
+          padding: '0 24px',
+          gap: 16,
+        }}
+      >
+        <div className="sh-skeleton" style={{ width: 28, height: 28, borderRadius: 6 }} />
+        <div className="sh-skeleton" style={{ width: 120, height: 14, borderRadius: 6 }} />
+        <div style={{ flex: 1 }} />
+        <div className="sh-skeleton" style={{ width: 32, height: 32, borderRadius: '50%' }} />
+      </div>
+      {/* Content skeleton */}
+      <div style={{ maxWidth: 800, margin: '32px auto', padding: '0 20px' }}>
+        <div
+          className="sh-skeleton"
+          style={{ width: '45%', height: 22, borderRadius: 8, marginBottom: 20 }}
+        />
+        <div
+          className="sh-skeleton"
+          style={{ width: '100%', height: 14, borderRadius: 6, marginBottom: 12 }}
+        />
+        <div
+          className="sh-skeleton"
+          style={{ width: '80%', height: 14, borderRadius: 6, marginBottom: 12 }}
+        />
+        <div
+          className="sh-skeleton"
+          style={{ width: '60%', height: 14, borderRadius: 6, marginBottom: 24 }}
+        />
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+            gap: 16,
+          }}
+        >
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              style={{
+                background: 'var(--sh-surface, #fff)',
+                borderRadius: 16,
+                border: '1px solid var(--sh-border, #e2e8f0)',
+                padding: '20px 22px',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                <div
+                  className="sh-skeleton"
+                  style={{ width: 36, height: 36, borderRadius: '50%' }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div
+                    className="sh-skeleton"
+                    style={{ width: '60%', height: 12, borderRadius: 6, marginBottom: 6 }}
+                  />
+                  <div
+                    className="sh-skeleton"
+                    style={{ width: '40%', height: 10, borderRadius: 6 }}
+                  />
+                </div>
+              </div>
+              <div
+                className="sh-skeleton"
+                style={{ width: '75%', height: 14, borderRadius: 6, marginBottom: 8 }}
+              />
+              <div
+                className="sh-skeleton"
+                style={{ width: '100%', height: 10, borderRadius: 6, marginBottom: 6 }}
+              />
+              <div className="sh-skeleton" style={{ width: '85%', height: 10, borderRadius: 6 }} />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AuthenticatedAiProvider({ children }) {
+  const { isAuthenticated } = useSession()
+  if (!isAuthenticated) return children
+  return (
+    <Suspense fallback={children}>
+      <AiChatProviderModule>{children}</AiChatProviderModule>
+    </Suspense>
+  )
+}
+
+function AuthenticatedBubble() {
+  const { isAuthenticated } = useSession()
+  if (!isAuthenticated) return null
+  return (
+    <Suspense fallback={null}>
+      <AiBubble />
+    </Suspense>
+  )
+}
+
+function AppRoutes() {
+  const isMobile = isNativePlatform()
+
+  // In the Capacitor native shell, render the mobile-optimized app
+  if (isMobile) {
+    return (
+      <BrowserRouter>
+        <SessionProvider>
+          <Suspense fallback={<RouteFallback />}>
+            <AppMobile />
+          </Suspense>
+        </SessionProvider>
+      </BrowserRouter>
+    )
+  }
+
+  return (
+    <BrowserRouter>
+      <SessionProvider>
+        <RouteVisualScope>
+          <a href="#main-content" className="skip-to-content">
+            Skip to main content
+          </a>
+          <RouteAnnouncer />
+          <RouteTelemetry />
+          <SwUpdateAutoReloader />
+          <PreferencesBootstrap />
+          <LegalAcceptanceEnforcementModal />
+          {/* Self-hosted cookie consent (Task #70 — replaces the
+              Termly resource-blocker that third-party cookie blockers
+              were stripping). Renders for both authenticated and
+              unauthenticated users; native shell short-circuits via
+              window.__SH_NATIVE__. */}
+          <CookieConsentBanner />
+          <AuthenticatedAiProvider>
+            <ChatPanelProvider>
+              {/* Wrap the whole authenticated tree so any descendant
+                  can call `useAiPermission()` to gate an AI write
+                  action behind a Claude-Code-style approval dialog. */}
+              <AiPermissionProvider Dialog={AiPermissionDialog}>
+                <Suspense fallback={<RouteFallback />}>
+                  <Routes>
+                    {/* ── public (unauthenticated) ─────────────────────────── */}
+                    <Route
+                      path="/"
+                      element={
+                        <PublicRoute>
+                          <HomePage />
+                        </PublicRoute>
+                      }
+                    />
+                    <Route
+                      path="/login"
+                      element={
+                        <PublicRoute>
+                          <LoginPage />
+                        </PublicRoute>
+                      }
+                    />
+                    <Route
+                      path="/login/challenge/:id"
+                      element={
+                        <PublicRoute>
+                          <LoginChallengePage />
+                        </PublicRoute>
+                      }
+                    />
+                    <Route
+                      path="/register"
+                      element={
+                        <PublicRoute>
+                          <RegisterScreen />
+                        </PublicRoute>
+                      }
+                    />
+                    <Route
+                      path="/signup/role"
+                      element={
+                        <PublicRoute>
+                          <RolePickerPage />
+                        </PublicRoute>
+                      }
+                    />
+                    <Route path="/terms" element={<TermsPage />} />
+                    <Route path="/privacy" element={<PrivacyPage />} />
+                    <Route path="/guidelines" element={<GuidelinesPage />} />
+                    <Route path="/cookies" element={<CookiePolicyPage />} />
+                    <Route path="/disclaimer" element={<DisclaimerPage />} />
+                    <Route path="/data-request" element={<DataRequestPage />} />
+                    <Route path="/about" element={<AboutPage />} />
+                    {/* Public feature catalog — v2 design refresh Week 2 */}
+                    <Route path="/docs" element={<DocsPage />} />
+                    <Route path="/docs/:slug" element={<DocsFeaturePage />} />
+                    <Route path="/pricing" element={<PricingPage />} />
+                    <Route path="/supporters" element={<SupportersPage />} />
+                    <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+                    <Route path="/reset-password" element={<ResetPasswordPage />} />
+
+                    {/* ── authenticated ────────────────────────────────────── */}
+                    <Route
+                      path="/feed"
+                      element={
+                        <PrivateRoute>
+                          <FeedPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets"
+                      element={
+                        <PrivateRoute>
+                          <SheetsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    {/* Teacher workspace — v2 design refresh Week 2. Non-
+                     teachers are redirected inside the component to /sheets.
+                     Bare `/teach` redirects to the materials index so a
+                     direct URL or a sidebar shortcut without the segment
+                     doesn't 404. */}
+                    <Route path="/teach" element={<Navigate to="/teach/materials" replace />} />
+                    {/* Bare `/signup` is a common URL the OAuth role picker
+                     and external links land on. Without this redirect, the
+                     Cancel button on the role picker (which navigates to
+                     `/signup`) 404s instead of returning the user to the
+                     register form. */}
+                    <Route path="/signup" element={<Navigate to="/register" replace />} />
+                    <Route
+                      path="/teach/materials"
+                      element={
+                        <PrivateRoute>
+                          <TeachMaterialsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/upload"
+                      element={
+                        <PrivateRoute>
+                          <UploadSheetPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/new/lab"
+                      element={
+                        <PrivateRoute>
+                          <AiSheetSetupPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/:id/edit"
+                      element={
+                        <PrivateRoute>
+                          <EditRedirect />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/:id/lab"
+                      element={
+                        <PrivateRoute>
+                          <SheetLabPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/:id/plagiarism"
+                      element={
+                        <PrivateRoute>
+                          <PlagiarismReportPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/:id"
+                      element={
+                        <PrivateRoute>
+                          <SheetViewerPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/sheets/preview/html/:id"
+                      element={
+                        <PrivateRoute>
+                          <SheetHtmlPreviewPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/preview/:scope/:id"
+                      element={
+                        <PrivateRoute>
+                          <AttachmentPreviewPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/tests"
+                      element={
+                        <PrivateRoute>
+                          <TestsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/tests/:id"
+                      element={
+                        <PrivateRoute>
+                          <TestTakerPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/notes"
+                      element={
+                        <PrivateRoute>
+                          <NotesPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/messages"
+                      element={
+                        <PrivateRoute>
+                          <MessagesPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/study-groups"
+                      element={
+                        <PrivateRoute>
+                          <StudyGroupsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/study-groups/:id"
+                      element={
+                        <PrivateRoute>
+                          <StudyGroupsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/ai"
+                      element={
+                        <PrivateRoute>
+                          <AiPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/library"
+                      element={
+                        <PrivateRoute>
+                          <LibraryPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/library/:volumeId/read"
+                      element={
+                        <PrivateRoute>
+                          <BookReaderPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/library/:volumeId"
+                      element={
+                        <PrivateRoute>
+                          <BookDetailPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    {/* Scholar v1 + v1.5 — peer-reviewed papers (master plan §18) */}
+                    <Route
+                      path="/scholar"
+                      element={
+                        <PrivateRoute>
+                          <ScholarPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/scholar/search"
+                      element={
+                        <PrivateRoute>
+                          <ScholarSearchPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/scholar/saved"
+                      element={
+                        <PrivateRoute>
+                          <ScholarSavedPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/scholar/shelf/:id"
+                      element={
+                        <PrivateRoute>
+                          <ScholarSavedPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/scholar/topic/:slug"
+                      element={
+                        <PrivateRoute>
+                          <ScholarTopicPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/scholar/paper/:id"
+                      element={
+                        <PrivateRoute>
+                          <ScholarPaperPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/playground"
+                      element={
+                        <PrivateRoute>
+                          <PlaygroundPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/notes/:id"
+                      element={
+                        <PrivateRoute>
+                          <NoteViewerPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/announcements"
+                      element={
+                        <PrivateRoute>
+                          <AnnouncementsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/notifications"
+                      element={
+                        <PrivateRoute>
+                          <NotificationsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    {/* Achievements V2 (2026-04-30) — full gallery + detail page. */}
+                    <Route
+                      path="/achievements"
+                      element={
+                        <PrivateRoute>
+                          <AchievementsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/achievements/:slug"
+                      element={
+                        <PrivateRoute>
+                          <AchievementDetailPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/submit"
+                      element={
+                        <PrivateRoute>
+                          <SubmitPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/my-courses"
+                      element={
+                        <PrivateRoute>
+                          <MyCoursesPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/invite"
+                      element={
+                        <PrivateRoute>
+                          <InvitePage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/review"
+                      element={
+                        <PrivateRoute>
+                          <ReviewPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/admin"
+                      element={
+                        <PrivateRoute>
+                          <AdminPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/dashboard"
+                      element={
+                        <PrivateRoute>
+                          <DashboardRedirect />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="/settings"
+                      element={
+                        <PrivateRoute>
+                          <SettingsPage />
+                        </PrivateRoute>
+                      }
+                    />
+                    {/* Admin MFA enforcement gate landing page. The login
+                      flow returns 403 MFA_SETUP_REQUIRED with this path
+                      when an admin needs to enable 2FA. */}
+                    <Route
+                      path="/settings/security/setup-2fa"
+                      element={
+                        <PrivateRoute>
+                          <Setup2FAPage />
+                        </PrivateRoute>
+                      }
+                    />
+
+                    <Route
+                      path="/onboarding"
+                      element={
+                        <PrivateRoute>
+                          <OnboardingPage />
+                        </PrivateRoute>
+                      }
+                    />
+
+                    {/* ── public user profiles ─────────────────────────────── */}
+                    <Route path="/users/:username" element={<UserProfilePage />} />
+
+                    {/* Dev-only Playwright focus-trap harness. The route +
+                      element are tree-shaken from prod bundles via the
+                      import.meta.env.DEV gate above. */}
+                    {FocusTrapHarnessPage && (
+                      <Route path="/__a11y/dialog" element={<FocusTrapHarnessPage />} />
+                    )}
+
+                    {/* ── catch-all ────────────────────────────────────────── */}
+                    <Route path="*" element={<NotFoundPage />} />
+                  </Routes>
+                </Suspense>
+                <ScrollToTop />
+                <ToastContainer />
+                <FirstCreationCelebration />
+                <OfflineIndicator />
+                {/* Achievements V2 — celebration modal for ?celebrate=:slug
+                  fires globally so unlocks anywhere in the app surface a
+                  visible moment without per-page mounting. The listener
+                  bridges the dedicated `achievement:unlock` Socket.io
+                  event into the same URL-param flow. */}
+                <AchievementUnlockListenerBridge />
+                <Suspense fallback={null}>
+                  <AchievementUnlockModal />
+                </Suspense>
+                <AuthenticatedBubble />
+              </AiPermissionProvider>
+            </ChatPanelProvider>
+          </AuthenticatedAiProvider>
+          {PerfOverlay && (
+            <Suspense fallback={null}>
+              <PerfOverlay />
+            </Suspense>
+          )}
+        </RouteVisualScope>
+      </SessionProvider>
+    </BrowserRouter>
+  )
+}
+
+export default function App() {
+  if (!GOOGLE_CLIENT_ID) return <AppRoutes />
+
+  return (
+    <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+      <AppRoutes />
+    </GoogleOAuthProvider>
+  )
+}

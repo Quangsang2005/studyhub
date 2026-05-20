@@ -1,0 +1,88 @@
+/**
+ * getUserPlan.js -- Resolve the active subscription plan for a user.
+ * Returns 'free', 'pro_monthly', or 'pro_yearly'.
+ * Wrapped in try-catch for graceful degradation if Subscription table is not yet migrated.
+ */
+const prisma = require('./prisma')
+
+// Active statuses that grant Pro access. `past_due` is intentionally NOT
+// here as of 2026-05-03: previously a payment failure granted up to 3
+// weeks of free Pro while Stripe's smart retry chain ran. Now we treat
+// past_due as a hard cutoff — the UI shows a "fix payment" banner but the
+// quotas drop to free. The user can restore Pro by updating their card via
+// the Stripe Customer Portal.
+const ACTIVE_STATUSES = ['active', 'trialing']
+
+async function getUserPlan(userId) {
+  try {
+    const sub = await prisma.subscription.findUnique({
+      where: { userId },
+      select: { plan: true, status: true, currentPeriodEnd: true },
+    })
+    if (sub && ACTIVE_STATUSES.includes(sub.status)) {
+      // Gift subscriptions and one-off Pro grants set status='active' with
+      // a hard `currentPeriodEnd` date and no Stripe webhook to flip them
+      // to 'canceled' afterwards. Without this expiry check, a 30-day gift
+      // would confer Pro forever. Treat any expired period as free.
+      if (sub.currentPeriodEnd && new Date(sub.currentPeriodEnd) <= new Date()) {
+        return 'free'
+      }
+      return sub.plan || 'free'
+    }
+  } catch {
+    // Subscription table may not exist yet -- graceful degradation
+  }
+
+  // Check referral reward Pro time
+  try {
+    const rewardUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { proRewardExpiresAt: true },
+    })
+    if (rewardUser?.proRewardExpiresAt && new Date(rewardUser.proRewardExpiresAt) > new Date()) {
+      return 'pro_monthly'
+    }
+  } catch {
+    // graceful degradation
+  }
+
+  return 'free'
+}
+
+function isPro(plan) {
+  return plan === 'pro_monthly' || plan === 'pro_yearly'
+}
+
+/**
+ * Check if a user is a donor (has any completed donation).
+ * Returns { isDonor, donorLevel, totalCents }.
+ */
+async function getDonorStatus(userId) {
+  try {
+    const result = await prisma.donation.aggregate({
+      where: { userId, status: 'completed' },
+      _sum: { amount: true },
+    })
+    const totalCents = result._sum.amount || 0
+    if (totalCents >= 10000) return { isDonor: true, donorLevel: 'gold', totalCents }
+    if (totalCents >= 2500) return { isDonor: true, donorLevel: 'silver', totalCents }
+    if (totalCents >= 100) return { isDonor: true, donorLevel: 'bronze', totalCents }
+    return { isDonor: false, donorLevel: null, totalCents }
+  } catch {
+    return { isDonor: false, donorLevel: null, totalCents: 0 }
+  }
+}
+
+/**
+ * Get the effective tier for a user: 'pro_monthly', 'pro_yearly', 'donor', or 'free'.
+ * Pro takes priority over donor.
+ */
+async function getUserTier(userId) {
+  const plan = await getUserPlan(userId)
+  if (isPro(plan)) return plan
+  const { isDonor } = await getDonorStatus(userId)
+  if (isDonor) return 'donor'
+  return 'free'
+}
+
+module.exports = { getUserPlan, isPro, getDonorStatus, getUserTier }

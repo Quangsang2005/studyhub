@@ -1,0 +1,172 @@
+const path = require('node:path')
+const prisma = require('../../core/db/prisma')
+const { SHEET_STATUS } = require('./sheets.constants')
+const { normalizeContentFormat } = require('../../lib/html/htmlSecurity')
+const { shouldAutoPublish } = require('../../lib/trustGate')
+
+function normalizeSheetStatus(value, fallback = SHEET_STATUS.PUBLISHED) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+  if (normalized === SHEET_STATUS.DRAFT) return SHEET_STATUS.DRAFT
+  if (normalized === SHEET_STATUS.PENDING_REVIEW) return SHEET_STATUS.PENDING_REVIEW
+  if (normalized === SHEET_STATUS.PUBLISHED) return SHEET_STATUS.PUBLISHED
+  if (normalized === SHEET_STATUS.REJECTED) return SHEET_STATUS.REJECTED
+  if (normalized === SHEET_STATUS.QUARANTINED) return SHEET_STATUS.QUARANTINED
+  return fallback
+}
+
+function sameUserId(left, right) {
+  return Number(left) === Number(right)
+}
+
+function canModerateOrOwnSheet(sheet, user) {
+  return Boolean(user && (user.role === 'admin' || sameUserId(user.userId, sheet.userId)))
+}
+
+function canReadSheet(sheet, user) {
+  if (sheet.status === SHEET_STATUS.PUBLISHED) return true
+  return canModerateOrOwnSheet(sheet, user)
+}
+
+function resolveNextSheetStatus({
+  requestedStatus,
+  contentFormat,
+  isDraftAutosave = false,
+  user = null,
+  currentStatus = null,
+}) {
+  const normalizedRequested = normalizeSheetStatus(requestedStatus, '')
+  if (normalizedRequested === SHEET_STATUS.DRAFT || isDraftAutosave) {
+    return SHEET_STATUS.DRAFT
+  }
+  if (contentFormat === 'html') {
+    return SHEET_STATUS.PENDING_REVIEW
+  }
+  // Preserve pending_review on edits — only an admin review should clear it
+  if (currentStatus === SHEET_STATUS.PENDING_REVIEW) {
+    return SHEET_STATUS.PENDING_REVIEW
+  }
+  if (user && !shouldAutoPublish(user)) {
+    return SHEET_STATUS.PENDING_REVIEW
+  }
+  return SHEET_STATUS.PUBLISHED
+}
+
+function safeDownloadName(name, fallbackExt = '') {
+  const ext = fallbackExt || path.extname(name || '')
+  const base =
+    String(name || 'studyhub-sheet')
+      .replace(path.extname(String(name || '')), '')
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 80) || 'studyhub-sheet'
+
+  return `${base}${ext}`.toLowerCase()
+}
+
+function firstHeaderValue(value) {
+  if (Array.isArray(value)) return firstHeaderValue(value[0])
+  return String(value || '')
+    .split(',')[0]
+    .trim()
+}
+
+function normalizePreviewProtocol(value) {
+  const protocol = firstHeaderValue(value).replace(/:$/, '').toLowerCase()
+  return protocol === 'https' || protocol === 'http' ? protocol : ''
+}
+
+function isLocalPreviewHost(hostname) {
+  const normalized = String(hostname || '').toLowerCase()
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '[::1]'
+}
+
+function isTrustedPreviewHost(hostname) {
+  const normalized = String(hostname || '').toLowerCase()
+  return (
+    isLocalPreviewHost(normalized) ||
+    normalized === 'api.getstudyhub.org' ||
+    normalized === 'sheets.getstudyhub.org' ||
+    normalized.endsWith('.up.railway.app')
+  )
+}
+
+function normalizePreviewHost(value) {
+  const host = firstHeaderValue(value).toLowerCase()
+  if (!host || host.length > 255 || /[\s/@\\?#]/.test(host)) return ''
+
+  try {
+    const parsed = new URL(`http://${host}`)
+    if (!parsed.hostname || !isTrustedPreviewHost(parsed.hostname)) return ''
+    return parsed.host
+  } catch {
+    return ''
+  }
+}
+
+function publicHttpsOrigin(origin, incomingProtocol = '') {
+  const parsed = new URL(origin)
+  if (
+    parsed.protocol === 'http:' &&
+    incomingProtocol === 'https' &&
+    !isLocalPreviewHost(parsed.hostname)
+  ) {
+    parsed.protocol = 'https:'
+  }
+  return parsed.origin
+}
+
+function resolvePreviewOrigin(req) {
+  const forwardedProtocol = normalizePreviewProtocol(req?.get?.('x-forwarded-proto'))
+  const incomingProtocol = forwardedProtocol || normalizePreviewProtocol(req?.protocol) || 'http'
+  const configuredOrigin = String(process.env.HTML_PREVIEW_ORIGIN || '').trim()
+
+  if (configuredOrigin) {
+    try {
+      return publicHttpsOrigin(configuredOrigin, incomingProtocol)
+    } catch {
+      // Fall back to the current request origin when misconfigured.
+    }
+  }
+
+  // Host header is client-controlled. We pass it through normalizePreviewHost,
+  // which validates the hostname against an allowlist (isTrustedPreviewHost)
+  // — so a spoofed Host that doesn't match a known StudyHub origin is
+  // rejected and we fall back to a safe default. In production the default
+  // is the canonical API origin; in dev it's localhost:4000.
+  const trustedHost = normalizePreviewHost(req?.get?.('host'))
+  if (trustedHost) {
+    return `${incomingProtocol}://${trustedHost}`
+  }
+
+  const fallbackHost =
+    process.env.NODE_ENV === 'production' ? 'api.getstudyhub.org' : 'localhost:4000'
+  const fallbackProtocol = process.env.NODE_ENV === 'production' ? 'https' : incomingProtocol
+  return `${fallbackProtocol}://${fallbackHost}`
+}
+
+/**
+ * Reads the user's defaultDownloads preference from UserPreferences.
+ * Returns true if no preference record exists (safe default).
+ */
+async function getUserDefaultDownloads(userId) {
+  const prefs = await prisma.userPreferences.findUnique({
+    where: { userId },
+    select: { defaultDownloads: true },
+  })
+  return prefs?.defaultDownloads !== false
+}
+
+module.exports = {
+  normalizeSheetStatus,
+  sameUserId,
+  canModerateOrOwnSheet,
+  canReadSheet,
+  resolveNextSheetStatus,
+  safeDownloadName,
+  resolvePreviewOrigin,
+  getUserDefaultDownloads,
+  normalizeContentFormat,
+}
