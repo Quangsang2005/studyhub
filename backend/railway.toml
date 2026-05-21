@@ -12,7 +12,6 @@ buildCommand = "npm install && npx prisma generate"
 # means restarts, crash-recoveries, and Dockerfile-built deploys all
 # self-provision shipped flags without an operator running anything by
 # hand. preDeployCommand here only handles best-effort GeoIP refresh.
-preDeployCommand = ""
 startCommand = "npm start"
 healthcheckPath = "/health"
 healthcheckTimeout = 60
